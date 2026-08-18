@@ -3,8 +3,8 @@ on:
   workflow_dispatch:
     inputs:
       repo:
-        description: 'owner/repo cần làm việc'
-        required: true
+        description: 'owner/repo (để trống = dùng repo hiện tại; nếu chưa tồn tại sẽ tự tạo)'
+        required: false
       base_url:
         description: 'ANTHROPIC_BASE_URL'
         required: true
@@ -12,7 +12,7 @@ on:
         description: 'ANTHROPIC_MODEL'
         required: true
       api_key:
-        description: '⚠️ ANTHROPIC_AUTH_TOKEN — để trống sẽ dùng secret có sẵn (AN TOÀN HƠN). Nếu gõ vào đây và repo PUBLIC, key sẽ lộ trong lịch sử run cho bất kỳ ai xem được, dù đã mask log.'
+        description: '⚠️ ANTHROPIC_AUTH_TOKEN — để trống sẽ dùng secret có sẵn (AN TOÀN HƠN). Nếu gõ vào và repo PUBLIC, key sẽ lộ trong lịch sử run.'
         required: false
 
 jobs:
@@ -20,20 +20,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
+      - name: Xác định repo mục tiêu
+        id: target
+        run: |
+          REPO="${{ inputs.repo }}"
+          if [ -z "$REPO" ]; then REPO="${{ github.repository }}"; fi
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+
       - name: Xác định API key + cảnh báo nếu dùng trigger input
         id: resolve_key
         run: |
           if [ -n "${{ inputs.api_key }}" ]; then
-            echo "::warning::Bạn đang dùng API key nhập trực tiếp qua trigger input. Nếu repo PUBLIC, key này sẽ hiển thị lại trong lịch sử run cho bất kỳ ai xem, kể cả sau khi mask log. Khuyến nghị: để trống input và dùng secret ANTHROPIC_AUTH_TOKEN thay thế."
+            echo "::warning::Bạn đang dùng API key nhập trực tiếp qua trigger input. Nếu repo PUBLIC, key này sẽ hiển thị lại trong lịch sử run cho bất kỳ ai xem. Khuyến nghị dùng secret ANTHROPIC_AUTH_TOKEN thay thế."
             echo "::add-mask::${{ inputs.api_key }}"
             echo "key=${{ inputs.api_key }}" >> "$GITHUB_OUTPUT"
           else
             echo "key=${{ secrets.ANTHROPIC_AUTH_TOKEN }}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Tạo repo nếu chưa tồn tại
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh repo view "${{ steps.target.outputs.repo }}" >/dev/null 2>&1 || \
+          gh repo create "${{ steps.target.outputs.repo }}" --private --confirm
+
       - uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.repo }}
+          repository: ${{ steps.target.outputs.repo }}
           token: ${{ secrets.GH_PAT }}
 
       - name: Cài Claude Code + ttyd + cloudflared
@@ -66,6 +80,7 @@ jobs:
         run: |
           git add -A && git commit -m "final save" || true
           git push || true
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
