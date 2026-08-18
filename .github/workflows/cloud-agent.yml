@@ -14,6 +14,9 @@ on:
       api_key:
         description: '⚠️ ANTHROPIC_AUTH_TOKEN — để trống sẽ dùng secret có sẵn (AN TOÀN HƠN). Nếu gõ vào và repo PUBLIC, key sẽ lộ trong lịch sử run.'
         required: false
+      context_window:
+        description: 'Context window thật của model (số token, ví dụ 128000). Để trống = không set, dùng mặc định của Claude Code.'
+        required: false
 
 jobs:
   agent:
@@ -50,21 +53,61 @@ jobs:
           repository: ${{ steps.target.outputs.repo }}
           token: ${{ secrets.GH_PAT }}
 
-      - name: Cài Claude Code + ttyd + cloudflared
+      - name: Cài Claude Code + ttyd + tmux + cloudflared
         run: |
           curl -fsSL https://claude.ai/install.sh | bash
-          sudo apt-get update && sudo apt-get install -y ttyd
+          sudo apt-get update && sudo apt-get install -y ttyd tmux
           # apt cài ttyd kèm 1 systemd service tự bật sẵn, chiếm cổng 7681 -> phải tắt trước khi tự chạy tay
           sudo systemctl stop ttyd || true
           sudo systemctl disable ttyd || true
           curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
           chmod +x cloudflared
 
-      - name: Auto-save nền (mỗi 5 phút)
+      - name: Set context window cho model (nếu có nhập)
+        if: ${{ inputs.context_window != '' }}
+        env:
+          CW_MODEL: ${{ inputs.model }}
+          CW_VALUE: ${{ inputs.context_window }}
         run: |
+          mkdir -p ~/.claude
+          cat > /tmp/set_context_window.py <<'PY'
+          import json, os
+
+          path = os.path.expanduser("~/.claude/settings.json")
+          model = os.environ["CW_MODEL"]
+          value = int(os.environ["CW_VALUE"])
+
+          data = {}
+          if os.path.exists(path):
+              try:
+                  with open(path) as f:
+                      data = json.load(f)
+              except Exception:
+                  data = {}
+
+          data.setdefault("modelOverrides", {})
+          data["modelOverrides"][model] = {"contextWindow": value}
+
+          with open(path, "w") as f:
+              json.dump(data, f, indent=2)
+          PY
+          # Ghi modelOverrides để Claude Code biết đúng context window thật của model,
+          # tránh mặc định đoán 200k khi model không nằm trong danh sách nhận diện sẵn.
+          python3 /tmp/set_context_window.py
+          cat ~/.claude/settings.json
+
+      - name: Auto-save nền (real-time, theo thay đổi file)
+        run: |
+          sudo apt-get install -y inotify-tools
           git config user.email "bot@ci"
           git config user.name "cloud-agent"
-          ( while true; do sleep 300
+          ( while true; do
+              # Chờ có thay đổi trong repo (bỏ qua .git để tránh tự kích hoạt lại
+              # khi git commit/push ghi vào .git)
+              inotifywait -r -e modify,create,delete,move --exclude '^\./\.git' -q .
+              # Debounce: gộp nhiều thay đổi liên tiếp (vd Claude Code ghi nhiều file
+              # liền nhau) lại thành 1 lần commit, đợi 5s im lặng không có sự kiện mới
+              while inotifywait -r -e modify,create,delete,move --exclude '^\./\.git' -q -t 5 .; do :; done
               git add -A && git commit -m "autosave $(date -u +%FT%TZ)" || true
               git push || true
             done ) &
@@ -74,8 +117,15 @@ jobs:
           ANTHROPIC_BASE_URL: ${{ inputs.base_url }}
           ANTHROPIC_AUTH_TOKEN: ${{ steps.resolve_key.outputs.key }}
           ANTHROPIC_MODEL: ${{ inputs.model }}
+          # Nếu không nhập context_window, tắt cảnh báo/enforcement thay vì để Claude Code
+          # tự đoán 200k cho model lạ (đỡ risk auto-compact sai thời điểm).
+          CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT: ${{ inputs.context_window == '' && '1' || '' }}
         run: |
-          ttyd -p 7681 -W bash &
+          # -W: cho phép ghi (nhập liệu) qua web
+          # tmux new-session -A -s main: nếu session "main" đã tồn tại (do reload trang) thì
+          # attach lại vào đúng session cũ thay vì tạo shell mới -> không mất tiến trình claude
+          # đang chạy khi reload/mất kết nối web.
+          ttyd -p 7681 -W tmux new-session -A -s main &
           ./cloudflared tunnel --url http://localhost:7681
 
       - name: Lưu chốt cuối cùng
