@@ -1,0 +1,91 @@
+name: Cloud Agent
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'owner/repo (để trống = dùng repo hiện tại; nếu chưa tồn tại sẽ tự tạo)'
+        required: false
+      base_url:
+        description: 'ANTHROPIC_BASE_URL'
+        required: true
+      model:
+        description: 'ANTHROPIC_MODEL'
+        required: true
+      api_key:
+        description: '⚠️ ANTHROPIC_AUTH_TOKEN — để trống sẽ dùng secret có sẵn (AN TOÀN HƠN). Nếu gõ vào và repo PUBLIC, key sẽ lộ trong lịch sử run.'
+        required: false
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Xác định repo mục tiêu
+        id: target
+        run: |
+          REPO="${{ inputs.repo }}"
+          if [ -z "$REPO" ]; then REPO="${{ github.repository }}"; fi
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+
+      - name: Xác định API key + cảnh báo nếu dùng trigger input
+        id: resolve_key
+        run: |
+          if [ -n "${{ inputs.api_key }}" ]; then
+            echo "::warning::Bạn đang dùng API key nhập trực tiếp qua trigger input. Nếu repo PUBLIC, key này sẽ hiển thị lại trong lịch sử run cho bất kỳ ai xem. Khuyến nghị dùng secret ANTHROPIC_AUTH_TOKEN thay thế."
+            echo "::add-mask::${{ inputs.api_key }}"
+            echo "key=${{ inputs.api_key }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "key=${{ secrets.ANTHROPIC_AUTH_TOKEN }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tạo repo nếu chưa tồn tại (có README để có sẵn branch main)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh repo view "${{ steps.target.outputs.repo }}" >/dev/null 2>&1 || \
+          gh repo create "${{ steps.target.outputs.repo }}" --private --add-readme
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.target.outputs.repo }}
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Cài Claude Code + ttyd + cloudflared
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash
+          sudo apt-get update && sudo apt-get install -y ttyd
+          # apt cài ttyd kèm 1 systemd service tự bật sẵn, chiếm cổng 7681 -> phải tắt trước khi tự chạy tay
+          sudo systemctl stop ttyd || true
+          sudo systemctl disable ttyd || true
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+
+      - name: Auto-save nền (mỗi 5 phút)
+        run: |
+          git config user.email "bot@ci"
+          git config user.name "cloud-agent"
+          ( while true; do sleep 300
+              git add -A && git commit -m "autosave $(date -u +%FT%TZ)" || true
+              git push || true
+            done ) &
+
+      - name: Mở terminal + tunnel
+        env:
+          ANTHROPIC_BASE_URL: ${{ inputs.base_url }}
+          ANTHROPIC_AUTH_TOKEN: ${{ steps.resolve_key.outputs.key }}
+          ANTHROPIC_MODEL: ${{ inputs.model }}
+        run: |
+          ttyd -p 7681 -W bash &
+          ./cloudflared tunnel --url http://localhost:7681
+
+      - name: Lưu chốt cuối cùng
+        if: always()
+        run: |
+          git add -A && git commit -m "final save" || true
+          git push || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-code
+          path: .
