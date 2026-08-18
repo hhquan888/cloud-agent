@@ -43,7 +43,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           gh repo view "${{ steps.target.outputs.repo }}" >/dev/null 2>&1 || \
-          gh repo create "${{ steps.target.outputs.repo }}" --private --add-readme
+          gh repo create "${{ steps.target.outputs.repo }}" --public --add-readme
 
       - uses: actions/checkout@v4
         with:
