@@ -38,12 +38,12 @@ jobs:
             echo "key=${{ secrets.ANTHROPIC_AUTH_TOKEN }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Tạo repo nếu chưa tồn tại
+      - name: Tạo repo nếu chưa tồn tại (có README để có sẵn branch main)
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           gh repo view "${{ steps.target.outputs.repo }}" >/dev/null 2>&1 || \
-          gh repo create "${{ steps.target.outputs.repo }}" --private --confirm
+          gh repo create "${{ steps.target.outputs.repo }}" --private --add-readme
 
       - uses: actions/checkout@v4
         with:
