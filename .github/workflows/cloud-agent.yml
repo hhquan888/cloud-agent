@@ -60,8 +60,12 @@ jobs:
           # apt cài ttyd kèm 1 systemd service tự bật sẵn, chiếm cổng 7681 -> phải tắt trước khi tự chạy tay
           sudo systemctl stop ttyd || true
           sudo systemctl disable ttyd || true
-          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
-          chmod +x cloudflared
+          # QUAN TRỌNG: tải ra NGOÀI thư mục repo (workspace), nếu không file binary này
+          # sẽ bị "git add -A" ở bước auto-save gom nhầm vào repo, che mất source thật
+          # mà agent tạo ra.
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
 
       - name: Set context window cho model (nếu có nhập)
         if: ${{ inputs.context_window != '' }}
@@ -101,16 +105,29 @@ jobs:
           sudo apt-get install -y inotify-tools
           git config user.email "bot@ci"
           git config user.name "cloud-agent"
-          ( while true; do
-              # Chờ có thay đổi trong repo (bỏ qua .git để tránh tự kích hoạt lại
-              # khi git commit/push ghi vào .git)
-              inotifywait -r -e modify,create,delete,move --exclude '^\./\.git' -q .
-              # Debounce: gộp nhiều thay đổi liên tiếp (vd Claude Code ghi nhiều file
-              # liền nhau) lại thành 1 lần commit, đợi 5s im lặng không có sự kiện mới
-              while inotifywait -r -e modify,create,delete,move --exclude '^\./\.git' -q -t 5 .; do :; done
-              git add -A && git commit -m "autosave $(date -u +%FT%TZ)" || true
-              git push || true
-            done ) &
+
+          # Baseline commit: chốt lại trạng thái sạch (sau khi cài Claude Code/ttyd,
+          # cloudflared đã KHÔNG còn nằm trong thư mục này) trước khi agent bắt đầu
+          # code, để mọi commit autosave sau đó chỉ chứa thay đổi thật của agent.
+          git add -A && git commit -m "baseline before agent" || true
+          git push || true
+
+          cat > /tmp/autosave.sh <<'SH'
+          #!/bin/bash
+          cd "$GITHUB_WORKSPACE"
+          while true; do
+            inotifywait -r -e modify,create,delete,move --exclude '^\./\.git' -q .
+            while inotifywait -r -e modify,create,delete,move --exclude '^\./\.git' -q -t 5 .; do :; done
+            git add -A && git commit -m "autosave $(date -u +%FT%TZ)" || true
+            git push || true
+          done
+          SH
+          chmod +x /tmp/autosave.sh
+
+          # setsid + nohup + disown: tách hẳn tiến trình khỏi process group của step này,
+          # để runner không dọn nó khi step kết thúc và chuyển sang step tiếp theo.
+          setsid nohup /tmp/autosave.sh > /tmp/autosave.log 2>&1 < /dev/null &
+          disown
 
       - name: Mở terminal + tunnel
         env:
@@ -126,13 +143,17 @@ jobs:
           # attach lại vào đúng session cũ thay vì tạo shell mới -> không mất tiến trình claude
           # đang chạy khi reload/mất kết nối web.
           ttyd -p 7681 -W tmux new-session -A -s main &
-          ./cloudflared tunnel --url http://localhost:7681
+          cloudflared tunnel --url http://localhost:7681
 
       - name: Lưu chốt cuối cùng
         if: always()
         run: |
+          echo "----- autosave.log -----"
+          cat /tmp/autosave.log || true
+          echo "-------------------------"
           git add -A && git commit -m "final save" || true
           git push || true
+          git log --oneline -n 20
 
       - uses: actions/upload-artifact@v4
         if: always()
