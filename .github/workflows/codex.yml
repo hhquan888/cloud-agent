@@ -1,0 +1,146 @@
+name: Cloud Agent (Codex)
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 'owner/repo (để trống = dùng repo hiện tại; nếu chưa tồn tại sẽ tự tạo)'
+        required: false
+      base_url:
+        description: 'OPENAI_BASE_URL (địa chỉ route tự host của bạn)'
+        required: true
+      model:
+        description: 'Tên model, ví dụ: cgpt-web/gpt-5.6-thinking'
+        required: true
+      api_key:
+        description: '⚠️ OPENAI_API_KEY — để trống sẽ dùng secret có sẵn (AN TOÀN HƠN). Nếu gõ vào và repo PUBLIC, key sẽ lộ trong lịch sử run.'
+        required: false
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Xác định repo mục tiêu
+        id: target
+        run: |
+          REPO="${{ inputs.repo }}"
+          if [ -z "$REPO" ]; then REPO="${{ github.repository }}"; fi
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+
+      - name: Xác định API key + cảnh báo nếu dùng trigger input
+        id: resolve_key
+        run: |
+          if [ -n "${{ inputs.api_key }}" ]; then
+            echo "::warning::Bạn đang dùng API key nhập trực tiếp qua trigger input. Nếu repo PUBLIC, key này sẽ hiển thị lại trong lịch sử run cho bất kỳ ai xem. Khuyến nghị dùng secret OPENAI_API_KEY thay thế."
+            echo "::add-mask::${{ inputs.api_key }}"
+            echo "key=${{ inputs.api_key }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "key=${{ secrets.OPENAI_API_KEY }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tạo repo nếu chưa tồn tại (có README để có sẵn branch main)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh repo view "${{ steps.target.outputs.repo }}" >/dev/null 2>&1 || \
+          gh repo create "${{ steps.target.outputs.repo }}" --public --add-readme
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.target.outputs.repo }}
+          token: ${{ secrets.GH_PAT }}
+
+      # ⚠️ CHƯA XÁC MINH: lệnh cài Codex CLI bên dưới cần bạn tự kiểm tra lại đúng
+      # cách cài chính thức (npm package name, hoặc binary release) trước khi dùng.
+      - name: Cài Codex CLI + ttyd + tmux + cloudflared
+        run: |
+          sudo apt-get update && sudo apt-get install -y nodejs npm ttyd tmux
+          npm install -g @openai/codex   # <-- kiểm tra lại tên package chính xác
+          # apt cài ttyd kèm 1 systemd service tự bật sẵn, chiếm cổng 7681 -> phải tắt trước khi tự chạy tay
+          sudo systemctl stop ttyd || true
+          sudo systemctl disable ttyd || true
+          # QUAN TRỌNG: tải ra NGOÀI thư mục repo (workspace), nếu không file binary này
+          # sẽ bị "git add -A" ở bước auto-save gom nhầm vào repo, che mất source thật
+          # mà agent tạo ra.
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
+
+      # Bước "Set context window" của bản Claude Code đã bị BỎ ở đây vì đó là cơ chế
+      # riêng của Claude Code (~/.claude/settings.json -> modelOverrides). Codex CLI có
+      # cơ chế cấu hình model/context riêng (thường ~/.codex/config.toml hoặc tương tự)
+      # — nếu bạn cần set context window cho model, tự thêm bước tương ứng sau khi xác
+      # nhận đúng format cấu hình của Codex CLI bạn đang dùng.
+
+      - name: Auto-save nền (real-time, theo thay đổi file)
+        run: |
+          sudo apt-get install -y inotify-tools
+          git config user.email "bot@ci"
+          git config user.name "cloud-agent"
+
+          # Chặn các pattern nhạy cảm/rác phổ biến khỏi bị autosave gom nhầm vào repo.
+          # Chỉnh lại danh sách này cho khớp với dự án thật của bạn.
+          cat >> .gitignore <<'GI'
+          .env
+          .env.*
+          *.pem
+          *.key
+          *_token*
+          *secret*
+          node_modules/
+          __pycache__/
+          GI
+
+          # Baseline commit: chốt lại trạng thái sạch (sau khi cài Claude Code/ttyd,
+          # cloudflared đã KHÔNG còn nằm trong thư mục này) trước khi agent bắt đầu
+          # code, để mọi commit autosave sau đó chỉ chứa thay đổi thật của agent.
+          git add -A && git commit -m "baseline before agent" || true
+          git push || true
+
+          cat > /tmp/autosave.sh <<'SH'
+          #!/bin/bash
+          cd "$GITHUB_WORKSPACE"
+          while true; do
+            inotifywait -r -e modify,create,delete,move --exclude '^\./\.git' -q .
+            while inotifywait -r -e modify,create,delete,move --exclude '^\./\.git' -q -t 5 .; do :; done
+            git add -A && git commit -m "autosave $(date -u +%FT%TZ)" || true
+            git push || true
+          done
+          SH
+          chmod +x /tmp/autosave.sh
+
+          # setsid + nohup + disown: tách hẳn tiến trình khỏi process group của step này,
+          # để runner không dọn nó khi step kết thúc và chuyển sang step tiếp theo.
+          setsid nohup /tmp/autosave.sh > /tmp/autosave.log 2>&1 < /dev/null &
+          disown
+
+      - name: Mở terminal + tunnel
+        env:
+          # ⚠️ CHƯA XÁC MINH: tên biến bên dưới theo quy ước OpenAI-style phổ biến.
+          # Kiểm tra lại docs của Codex CLI bạn dùng trước khi chạy thật.
+          OPENAI_BASE_URL: ${{ inputs.base_url }}
+          OPENAI_API_KEY: ${{ steps.resolve_key.outputs.key }}
+          OPENAI_MODEL: ${{ inputs.model }}
+        run: |
+          # -W: cho phép ghi (nhập liệu) qua web
+          # tmux new-session -A -s main: nếu session "main" đã tồn tại (do reload trang) thì
+          # attach lại vào đúng session cũ thay vì tạo shell mới -> không mất tiến trình claude
+          # đang chạy khi reload/mất kết nối web.
+          ttyd -p 7681 -W tmux new-session -A -s main &
+          cloudflared tunnel --url http://localhost:7681
+
+      - name: Lưu chốt cuối cùng
+        if: always()
+        run: |
+          echo "----- autosave.log -----"
+          cat /tmp/autosave.log || true
+          echo "-------------------------"
+          git add -A && git commit -m "final save" || true
+          git push || true
+          git log --oneline -n 20
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: source-code
+          path: .
